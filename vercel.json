@@ -2,7 +2,7 @@
   "functions": {
     "synth_app.py": {
       "maxDuration": 60,
-      "includeFiles": "{style_corpus.json,prompt_template.txt,products.csv}"
+      "includeFiles": "{style_corpus.json,prompt_template.txt,products.csv,products_snapshot.json}"
     }
   }
 }

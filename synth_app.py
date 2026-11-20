@@ -133,6 +133,18 @@ def sync_products():
             page += 1
 
 
+def load_snapshot():
+    """Fallback product list bundled with the app (used when snackible.com can't be reached)."""
+    try:
+        with open(os.path.join(HERE, "products_snapshot.json"), encoding="utf-8") as f:
+            rows = json.load(f)
+    except (OSError, ValueError) as e:
+        print("snapshot failed:", e)
+        return
+    with db() as c:
+        c.executemany("INSERT OR REPLACE INTO products VALUES(:id,:name,:handle,:ptype,:tags,:description,:image,:price)", rows)
+
+
 def product_text(p):
     return f"{p['name']} {p['ptype']} {p['tags']} {p['description']} {p['handle'].replace('-', ' ')}".lower()
 
@@ -359,13 +371,20 @@ def product_rows():
 
 @app.get("/api/state")
 def state():
+    note = ""
     if not product_rows():
-        sync_products()
+        try:
+            sync_products()
+        except Exception as e:              # site unreachable from this host -> use bundled snapshot
+            note = f"Live product sync failed ({e}); using bundled snapshot."
+            print("sync failed:", e)
+        if not product_rows():
+            load_snapshot()
     rows = product_rows()
     with db() as c:
         sc = {r["sentiment"]: r["n"] for r in c.execute(
             "SELECT sentiment, COUNT(*) n FROM synthetic_reviews WHERE week=? GROUP BY sentiment", (week_id(),))}
-    return jsonify({"products": rows, "week": week_id(), "key_set": bool(os.environ.get("GROQ_API_KEY")),
+    return jsonify({"note": note, "products": rows, "week": week_id(), "key_set": bool(os.environ.get("GROQ_API_KEY")),
                     "pos": sc.get("positive", 0), "neg": sc.get("negative", 0),
                     "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
                     "week_total": sum(r["this_week"] for r in rows),
@@ -500,7 +519,9 @@ input[type=number],input[type=search],select{border:1px solid var(--line);border
 const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
 let S={products:[]};
 const FL=['peri peri','masala','cheese','pizza','jalapeno','chocolate','vanilla','almond','ragi','jowar','millet','zucchini','beetroot','quinoa','ginger','coconut','peanut','caramel','protein','baked','sweet chilli','sriracha'];
-async function load(){S=await (await fetch('/api/state')).json();
+async function load(){try{const r=await fetch('/api/state');if(!r.ok)throw new Error('HTTP '+r.status+' '+(await r.text()).slice(0,300));S=await r.json()}
+ catch(e){$('#err').textContent='Could not load products: '+e;return}
+ if(S.note)$('#err').textContent=S.note;
  $('#wk').textContent=`Week ${S.week}: ${S.week_total}/${S.weekly_target}  |  positive ${S.pos} / negative ${S.neg}`;
  const k=$('#key');k.textContent=S.key_set?`Groq key set - ${S.model}`:'No GROQ_API_KEY in .env';k.className='pill '+(S.key_set?'ok':'bad');
  $('#wn').value=S.weekly_target;draw()}
