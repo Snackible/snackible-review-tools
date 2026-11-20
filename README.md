@@ -7,7 +7,7 @@
 Setup: `pip install -r requirements.txt`, copy `.env.example` to `.env`, add keys. Never commit `.env`.
 
 ## Deploying on Vercel
-- `app.py` is the Flask entrypoint. It serves `synth_app.py` by default; set env `APP=portal` on a second Vercel project to serve `portal.py`.
+- `pyproject.toml` sets the Vercel entrypoint (`synth_app:app`). To deploy the review portal instead, change it to `portal:app` (or use a second Vercel project).
 - Set env vars in Vercel: GROQ_API_KEY (synth), JUDGEME_API_TOKEN + SHOP_DOMAIN (portal), and APP_PASSWORD (login for both, strongly recommended).
 - Vercel's disk is temporary: SQLite lives in /tmp and is wiped between cold starts. Export CSVs often or move to a hosted database.
 - `prompt_template.txt` is the editable generation prompt; `style_corpus.json` holds the sample reviews used as style anchors.
