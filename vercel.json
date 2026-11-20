@@ -1,0 +1,8 @@
+{
+  "functions": {
+    "app.py": {
+      "maxDuration": 60,
+      "includeFiles": "{style_corpus.json,prompt_template.txt,products.csv}"
+    }
+  }
+}

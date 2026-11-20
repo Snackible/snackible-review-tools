@@ -18,7 +18,8 @@ import review_helper as rh
 app = Flask(__name__)
 SITE = "https://snackible.com"
 QUOTA = int(os.environ.get("WEEKLY_QUOTA", 5))
-DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reviews.db")
+# Vercel's filesystem is read-only except /tmp (wiped between cold starts); use a hosted DB for permanence.
+DB = "/tmp/reviews.db" if os.environ.get("VERCEL") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "reviews.db")
 
 
 def db():
@@ -255,6 +256,18 @@ def home():
     return render_template_string(PAGE)
 
 
+@app.before_request
+def password_gate():
+    """This app can publish to Judge.me: set APP_PASSWORD (any username) before putting it on a public URL."""
+    from flask import Response
+    pw = os.environ.get("APP_PASSWORD")
+    if pw:
+        a = request.authorization
+        if not a or a.password != pw:
+            return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Review portal"'})
+
+
+init_db()      # also on import, so serverless platforms get their tables
+
 if __name__ == "__main__":
-    init_db()
     app.run(port=5000, debug=False)

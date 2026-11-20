@@ -17,7 +17,10 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template_string, request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(HERE, "synthetic_reviews.db")
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+# Vercel's filesystem is read-only except /tmp, and /tmp is wiped between cold starts.
+# For permanent data on Vercel, switch to a hosted database (Postgres/Neon).
+DB = "/tmp/synthetic_reviews.db" if ON_VERCEL else os.path.join(HERE, "synthetic_reviews.db")
 SITE = "https://snackible.com"
 
 
@@ -54,6 +57,11 @@ def init_db():
             rating INTEGER, title TEXT, body TEXT, theme TEXT, persona TEXT, model TEXT,
             synthetic INTEGER DEFAULT 1);
         """)
+        cols = [r["name"] for r in c.execute("PRAGMA table_info(synthetic_reviews)")]
+        if "sentiment" not in cols:
+            c.execute("ALTER TABLE synthetic_reviews ADD COLUMN sentiment TEXT")
+            c.execute("UPDATE synthetic_reviews SET sentiment = CASE WHEN rating>=4 THEN 'positive' "
+                      "WHEN rating<=2 THEN 'negative' ELSE 'neutral' END")
     ensure_names()
 
 
@@ -139,6 +147,16 @@ GUARD = [
 ]
 
 
+GUARD += [
+    (r"pani.?puri", r"pani"), (r"khakra", r"khakra"), (r"dosa", r"dosa"), (r"bhujia", r"bhujia"),
+    (r"chakli", r"chakli"), (r"pudina", r"pudina|mint"), (r"thai", r"thai"), (r"cheddar", r"chedd"),
+    (r"calori", r"calori"), (r"maida", r"maida|refined flour"), (r"popped", r"popped"),
+    (r"healthy|guilt", r"health|guilt|fibre|fiber|protein|no refined|no added|baked|roast|millet|ragi|jowar|source of"),
+    (r"fried", r"fried|baked|roast|popped|air"), (r"oily", r"oil|baked|roast|popped"),
+    (r"chips?\b", r"chip"), (r"\bpuffs?\b", r"puff"), (r"cracker", r"cracker"), (r"\bbar\b", r"\bbar"),
+]
+
+
 def violates_guard(text, ptext):
     t = text.lower()
     for rv, ev in GUARD:
@@ -159,8 +177,85 @@ PERSONAS = ["college student", "working professional", "fitness-focused person",
 FOCUS = ["taste", "crunch and texture", "ingredients", "occasion for eating it", "value for money", "pack size",
          "family reaction", "swap for regular snacks", "would buy again", "flavour intensity", "how filling it is",
          "packaging"]
-MIX = {"realistic": {5: 45, 4: 38, 3: 10, 2: 4, 1: 3}, "balanced": {5: 20, 4: 20, 3: 20, 2: 20, 1: 20},
-       "positive": {5: 60, 4: 35, 3: 5}}
+# Binary sentiment only (no 3-star), so every review has a clean positive/negative label.
+MIX = {"binary": {5: 35, 4: 35, 2: 15, 1: 15},        # 70% positive / 30% negative
+       "balanced": {5: 25, 4: 25, 2: 25, 1: 25},      # 50 / 50
+       "realistic": {5: 50, 4: 40, 2: 6, 1: 4},       # mostly positive
+       "positive": {5: 50, 4: 50}}                    # positive only
+
+
+def sentiment_of(rating):
+    return "positive" if rating >= 4 else "negative"
+
+
+# ---- sample corpus (style anchors) and quality filters ----
+CORPUS = json.load(open(os.path.join(HERE, "style_corpus.json"), encoding="utf-8"))
+CORPUS_BODIES = [b for v in CORPUS.values() for b in v]
+CORPUS_VOCAB = set(re.findall(r"[a-z']+", " ".join(CORPUS_BODIES).lower()))
+PROMPT_FILE = os.path.join(HERE, "prompt_template.txt")
+FANCY = re.compile(r"delight|exquisite|indulg|satisf|enjoyable|remarkable|palate|culinary|symphony|elevat|savou?r|"
+                   r"scrumptious|wholesome|texture profile|well.balanced|impeccabl|exceptional|superb|flawless", re.I)
+MAX_WORDS, MAX_SENTENCES = 15, 2
+# Plain English a school student knows. Anything else must come from the sample reviews or the product's own text.
+BASIC = set("""a an the and or but so if as at by for from in into of on to with without not no yes very really too quite
+just still even also more most much many some any all every each both only i me my we our you your it its this that
+these those they them their he she him her his is are was were be been am do does did done have has had can could will
+would should may might must good great nice best better love loved like liked likes enjoy enjoyed tasty taste tastes
+tasted flavour flavor flavours yummy delicious fresh crunchy crispy crisp crunch light soft hard spicy spice hot sweet
+salty salt sour mild strong bland tangy snack snacks chips chip pack packet packing price size small big large less
+enough little lot lots bit again always never ever often once first time times day days week anytime today buy bought
+order ordered reorder try tried trying eat eating ate get got give gave make made makes feel feels felt find found keep
+kept come coming go family kids kid friends friend guests office travel trip movie night evening morning tea chai
+thing things something nothing everyone people one two three now here there when while after before during than then
+because though expected expect hoped worth skip next won't don't doesn't didn't isn't wasn't it's i'm i've same
+different new old real actual proper perfect right wrong okay fine bad poor way own such what which who how why where
+healthy health too tasting cheap costly expensive money value quality bag box jar piece pieces bite bites kind sort
+bought buying home work lunch dinner breakfast kids' mine yours ours am pm up down out over off back away around about
+sure maybe probably definitely surely anyway though although however instead rather quite pretty fairly slightly
+bit lot too many few couple dry oily greasy stale burnt dull weak heavy filling full empty finish finished left
+disappointed happy glad sad upset satisfied surprised surprise surprising unique interesting amazing awesome wonderful
+excellent superb fantastic terrible awful horrible worst waste overpriced""".split())
+CUT_OFF = {"no", "and", "the", "a", "an", "of", "to", "with", "for", "or", "but", "is", "are", "it", "i", "my", "not",
+           "so", "very", "too", "in", "on", "at", "as", "that", "this", "than", "but", "if"}
+
+
+def pick_samples(p, ptext, k=8):
+    """Prefer the sample reviews written for this product; fill with generic ones that don't name other products."""
+    ptoks = set(re.findall(r"[a-z]+", ptext))
+    best, score = None, 0
+    for key in CORPUS:
+        kt = set(re.findall(r"[a-z]+", key.lower()))
+        s = len(kt & ptoks) / len(kt)
+        if s > score:
+            best, score = key, s
+    own = list(CORPUS[best]) if best and score >= 0.8 else []
+    others = [b for key, v in CORPUS.items() if key != best for b in v if not violates_guard(b, ptext)]
+    random.shuffle(own); random.shuffle(others)
+    own = own[:5]
+    return (own + others)[:k]
+
+
+def quality_problem(body, ptext):
+    """Return a reason string if the review breaks the style or grounding rules, else None."""
+    words = re.findall(r"[A-Za-z0-9'%]+", body)
+    if not (3 <= len(words) <= MAX_WORDS):
+        return "length"
+    if len(re.findall(r"[.!?]+(?:\s|$)", body.strip())) > MAX_SENTENCES:
+        return "sentences"
+    if FANCY.search(body):
+        return "fancy vocab"
+    ptoks = set(re.findall(r"[a-z]+", ptext))
+    allowed = CORPUS_VOCAB | BASIC | ptoks          # sample words + plain English + this product's own words
+    for w in re.findall(r"[a-z']+", body.lower()):
+        if w not in allowed and not (w.endswith("s") and w[:-1] in allowed):
+            return f"outside vocabulary: {w}"
+    last = re.findall(r"[a-z']+", body.lower())[-1]
+    if last in CUT_OFF or re.search(r"\bno (refined|palm|added|artificial)\W*$", body.lower()):
+        return "cut-off ending"
+    for num in re.findall(r"\d+", body):
+        if num not in ptext:
+            return f"number not in product text: {num}"
+    return violates_guard(body, ptext) and "not in product"
 
 
 def llm_call(system, user):
@@ -187,9 +282,8 @@ def build_specs(n, mix):
     ratings = random.choices(list(MIX[mix]), weights=list(MIX[mix].values()), k=n)
     specs = []
     for i, rt in enumerate(ratings, 1):
-        specs.append({"id": i, "rating": rt, "persona": random.choice(PERSONAS),
-                      "focus": random.choice(FOCUS), "words": random.choice([8, 12, 18, 25, 40, 60]),
-                      "hinglish": random.random() < 0.12})
+        specs.append({"id": i, "rating": rt, "sentiment": sentiment_of(rt),
+                      "words": random.choice([4, 5, 6, 8, 10, 12, 14])})
     return specs
 
 
@@ -200,32 +294,19 @@ def generate_for_product(p, n, mix, batch_id):
         existing = [r["body"] for r in c.execute(
             "SELECT body FROM synthetic_reviews WHERE product_id=?", (p["id"],))]
         names = [r["name"] for r in c.execute("SELECT name FROM names")]
-    saved, tries = 0, 0
+    tmpl = open(PROMPT_FILE, encoding="utf-8").read()       # editable prompt, re-read on every call
+    sys_part, user_part = tmpl.split("\n\nPRODUCT", 1)
+    system = sys_part.replace("SYSTEM\n", "", 1).strip()
+    saved, tries, dropped = 0, 0, 0
     while saved < n and tries < 3:
         tries += 1
         want = min(10, n - saved)
-        specs = build_specs(want + 2, mix)          # small over-ask to absorb rejects
-        system = ("You write realistic synthetic customer reviews for a machine-learning training dataset "
-                  "for an Indian healthy-snack brand. Output valid JSON only.")
-        user = f"""PRODUCT
-Name: {p['name']}
-Type: {p['ptype']}
-Tags: {p['tags']}
-Description: {p['description']}
-
-Write one review per spec below.
-{json.dumps(specs)}
-
-RULES
-- Ground each review in THIS product: its flavour, ingredients, format, pack and claims that appear in the product text above. NEVER mention a flavour, ingredient or claim that is not in the product text (for example no chocolate on a savoury chip, no spice on a sweet dip).
-- Each spec has a "focus". Use it if it applies to this product, otherwise choose another focus that does.
-- Match the rating: 5 and 4 positive; 3 mixed; 2 and 1 critical with a specific plausible reason (flavour too strong or too mild, pack small for the price, less crunchy than expected). No health, safety or illness claims.
-- Length is about "words" words. If "hinglish" is true, include 1 to 3 Roman-script Hindi words (mast, paisa vasool, chatpata, etc.).
-- Style: proper English, simple sentence structure, minimal but correct punctuation. No emojis. No competitor brands. No reviewer names in the text. Do not mention that the review is synthetic.
-- Every review must be clearly different from the others in wording, opening word and angle.
-- Avoid these existing reviews: {json.dumps(existing[-6:])}
-- Title is 2 to 5 words.
-OUTPUT: {{"reviews":[{{"id":1,"title":"...","body":"...","theme":"one of the focus words"}}]}}"""
+        specs = build_specs(want + 3, mix)          # small over-ask to absorb rejected reviews
+        user = ("PRODUCT" + user_part).replace("{{PRODUCT_NAME}}", p["name"]) \
+            .replace("{{PRODUCT_TYPE}}", p["ptype"] or "").replace("{{PRODUCT_TAGS}}", p["tags"] or "") \
+            .replace("{{PRODUCT_DESCRIPTION}}", p["description"] or "") \
+            .replace("{{STYLE_SAMPLES}}", "\n".join(f"- {s}" for s in pick_samples(p, ptext))) \
+            .replace("{{SPECS}}", json.dumps([{k: v for k, v in s.items() if k != "rating"} for s in specs]))
         raw = llm_call(system, user)
         try:
             items = json.loads(raw)["reviews"]
@@ -237,39 +318,31 @@ OUTPUT: {{"reviews":[{{"id":1,"title":"...","body":"...","theme":"one of the foc
             for it in items:
                 if saved >= n:
                     break
-                body, title = (it.get("body") or "").strip(), (it.get("title") or "").strip()
+                body = re.sub(r"\s+", " ", (it.get("body") or "")).strip()
                 s = spec_by_id.get(it.get("id"))
-                if not body or not s or violates_guard(f"{title} {body}", ptext):
-                    continue
-                if any(similar(body, e) >= 0.55 for e in existing):
+                if not body or not s:
+                    continue                      # empty body = model chose to drop it (not grounded)
+                why = quality_problem(body, ptext)
+                if not why and (any(similar(body, e) >= 0.8 for e in existing)
+                                or any(similar(body, e) >= 0.85 for e in CORPUS_BODIES)):
+                    why = "duplicate"
+                if why:
+                    dropped += 1
                     continue
                 name = random.choice([x for x in names if x not in used_names] or names)
                 used_names.add(name)
                 c.execute("""INSERT INTO synthetic_reviews(batch_id,created_at,week,product_id,product_name,
-                    reviewer_name,rating,title,body,theme,persona,model,synthetic)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                    reviewer_name,rating,title,body,theme,persona,model,sentiment,synthetic)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
                           (batch_id, dt.datetime.now().isoformat(timespec="seconds"), week_id(), p["id"],
-                           p["name"], name, s["rating"], title, body, it.get("theme", s["focus"]),
-                           s["persona"], os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")))
+                           p["name"], name, s["rating"], "", body, "", "",
+                           os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"), s["sentiment"]))
                 existing.append(body)
                 saved += 1
-    return saved
+    return saved, dropped
 
 
-def run_job(job_id, plan, mix):
-    """plan = list of (product_row_dict, n)."""
-    job = JOBS[job_id]
-    job.update(total=sum(n for _, n in plan), done=0, status="running", errors=[])
-    delay = float(os.environ.get("CALL_DELAY_SECONDS", "2.2"))   # stay under Groq free-tier RPM
-    for p, n in plan:
-        try:
-            job["done"] += generate_for_product(p, n, mix, job_id)
-        except Exception as e:
-            job["errors"].append(f"{p['name']}: {e}")
-            if "GROQ_API_KEY" in str(e):
-                break
-        time.sleep(delay)
-    job["status"] = "finished"
+CHUNK = 8     # reviews per request: one Groq call, fits inside a serverless function's time limit
 
 
 # ------------------------------------------------------------------ api
@@ -286,7 +359,11 @@ def state():
     if not product_rows():
         sync_products()
     rows = product_rows()
+    with db() as c:
+        sc = {r["sentiment"]: r["n"] for r in c.execute(
+            "SELECT sentiment, COUNT(*) n FROM synthetic_reviews WHERE week=? GROUP BY sentiment", (week_id(),))}
     return jsonify({"products": rows, "week": week_id(), "key_set": bool(os.environ.get("GROQ_API_KEY")),
+                    "pos": sc.get("positive", 0), "neg": sc.get("negative", 0),
                     "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
                     "week_total": sum(r["this_week"] for r in rows),
                     "weekly_target": int(os.environ.get("WEEKLY_TARGET", 100))})
@@ -298,36 +375,52 @@ def sync():
     return jsonify({"ok": True})
 
 
+@app.get("/api/plan")
+def plan():
+    """Split a request into small chunks (<= CHUNK reviews, one product each). The browser runs them
+    one after another, so no background thread is needed (works on Vercel and locally)."""
+    rows = {r["id"]: r for r in product_rows()}
+    pid, count = request.args.get("product_id"), max(1, int(request.args.get("count", 100)))
+    alloc = {}
+    if pid:
+        alloc[int(pid)] = min(count, 50)
+    else:   # weekly batch: spread across products, emptiest this week first
+        order = sorted(rows.values(), key=lambda r: (r["this_week"], random.random()))
+        for r in itertools.islice(itertools.cycle(order), min(count, 1000)):
+            alloc[r["id"]] = alloc.get(r["id"], 0) + 1
+    chunks = []
+    for i, n in alloc.items():
+        while n > 0:
+            chunks.append({"product_id": i, "n": min(CHUNK, n)})
+            n -= CHUNK
+    random.shuffle(chunks)
+    return jsonify({"batch_id": uuid.uuid4().hex[:10], "chunks": chunks, "total": sum(c["n"] for c in chunks)})
+
+
 @app.post("/api/generate")
 def generate():
     d = request.json
-    mix = d.get("mix", "realistic")
     rows = {r["id"]: r for r in product_rows()}
-    if d.get("product_id"):
-        plan = [(rows[int(d["product_id"])], max(1, min(50, int(d["count"]))))]
-    else:   # weekly batch: spread N reviews across products, emptiest this week first
-        total = max(1, min(1000, int(d["count"])))
-        order = sorted(rows.values(), key=lambda r: (r["this_week"], random.random()))
-        alloc = {}
-        for r in itertools.islice(itertools.cycle(order), total):
-            alloc[r["id"]] = alloc.get(r["id"], 0) + 1
-        plan = [(rows[i], n) for i, n in alloc.items()]
-        random.shuffle(plan)
-    job_id = uuid.uuid4().hex[:10]
-    JOBS[job_id] = {"status": "queued", "total": sum(n for _, n in plan), "done": 0, "errors": []}
-    threading.Thread(target=run_job, args=(job_id, plan, mix), daemon=True).start()
-    return jsonify({"job_id": job_id})
-
-
-@app.get("/api/job/<job_id>")
-def job(job_id):
-    return jsonify(JOBS.get(job_id, {"status": "unknown"}))
+    p = rows.get(int(d["product_id"]))
+    if not p:
+        return jsonify({"error": "unknown product"}), 404
+    try:
+        saved, dropped = generate_for_product(p, max(1, min(CHUNK, int(d["n"]))), d.get("mix", "binary"),
+                                              d.get("batch_id", "manual"))
+    except Exception as e:
+        return jsonify({"error": f"{p['name']}: {e}"}), 500
+    with db() as c:
+        counts = {r["sentiment"]: r["n"] for r in c.execute(
+            "SELECT sentiment, COUNT(*) n FROM synthetic_reviews WHERE batch_id=? GROUP BY sentiment",
+            (d.get("batch_id", "manual"),))}
+    return jsonify({"saved": saved, "dropped": dropped, "pos": counts.get("positive", 0),
+                    "neg": counts.get("negative", 0)})
 
 
 @app.get("/api/reviews/<int:pid>")
 def reviews(pid):
     with db() as c:
-        rows = c.execute("SELECT id,created_at,reviewer_name,rating,title,body,theme,persona FROM synthetic_reviews "
+        rows = c.execute("SELECT id,created_at,reviewer_name,rating,sentiment,title,body,theme,persona FROM synthetic_reviews "
                          "WHERE product_id=? ORDER BY id DESC LIMIT 200", (pid,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
@@ -377,13 +470,14 @@ input[type=number],input[type=search],select{border:1px solid var(--line);border
 .panel.open{transform:none;box-shadow:-8px 0 30px rgba(0,0,0,.15)}.ph{padding:14px 16px;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:center}
 .pb{overflow:auto;padding:12px 16px;flex:1}.rv{border-bottom:1px solid var(--line);padding:10px 0}.rv b{display:block}
 .st{color:#e8a200;letter-spacing:1px}.rm{font-size:12px;color:var(--mut)}.x{margin-left:auto;background:none;color:var(--mut);padding:0 6px;font-size:20px}
+.sent{font-size:11px;font-weight:700;border-radius:9px;padding:1px 8px;margin-left:6px}.sent.positive{background:#dff3e4;color:#17692f}.sent.negative{background:#fbe0e0;color:#a31b1b}
 #err{color:#b00020;padding:0 24px;font-size:13px;white-space:pre-wrap}
 </style>
 <header><h1>Synthetic Review Dataset</h1><span class=badge>SYNTHETIC / ML TRAINING ONLY</span><span class=sp></span>
 <span class=pill id=wk></span><span class=pill id=key></span></header>
 <div class=bar>
  <b>Weekly batch</b><input type=number id=wn value=100 min=1 max=1000 style="width:80px">
- <select id=mix><option value=realistic>Realistic mix (mostly 4-5 star)</option><option value=balanced>Balanced 1-5 star</option><option value=positive>Positive only (3-5)</option></select>
+ <select id=mix><option value=binary>70% positive / 30% negative</option><option value=balanced>50% positive / 50% negative</option><option value=realistic>Mostly positive (90 / 10)</option><option value=positive>Positive only (4-5 star)</option></select>
  <button id=wb onclick=weekly()>Generate weekly batch</button>
  <div class=prog><i id=pg></i></div><span id=pt></span><span class=sp style="flex:1"></span>
  <input type=search id=q placeholder="Search products" oninput=draw()>
@@ -396,7 +490,7 @@ const $=s=>document.querySelector(s),esc=s=>String(s??'').replace(/&/g,'&amp;').
 let S={products:[]};
 const FL=['peri peri','masala','cheese','pizza','jalapeno','chocolate','vanilla','almond','ragi','jowar','millet','zucchini','beetroot','quinoa','ginger','coconut','peanut','caramel','protein','baked','sweet chilli','sriracha'];
 async function load(){S=await (await fetch('/api/state')).json();
- $('#wk').textContent=`Week ${S.week}: ${S.week_total}/${S.weekly_target}`;
+ $('#wk').textContent=`Week ${S.week}: ${S.week_total}/${S.weekly_target}  |  positive ${S.pos} / negative ${S.neg}`;
  const k=$('#key');k.textContent=S.key_set?`Groq key set - ${S.model}`:'No GROQ_API_KEY in .env';k.className='pill '+(S.key_set?'ok':'bad');
  $('#wn').value=S.weekly_target;draw()}
 function draw(){const q=$('#q').value.toLowerCase();
@@ -407,18 +501,25 @@ function draw(){const q=$('#q').value.toLowerCase();
  <div class=meta><span>${p.total} generated</span><span>${p.this_week} this week</span></div>
  <div class=act><input type=number id="n${p.id}" value=5 min=1 max=50><button onclick="gen(${p.id})">Generate</button>
  <button class=sec onclick="view(${p.id},'${esc(p.name).replace(/'/g,'')}')">View</button></div></div></div>`}).join('')}
-async function run(body){$('#err').textContent='';
- const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...body,mix:$('#mix').value})});
- const {job_id}=await r.json();document.querySelectorAll('button').forEach(b=>b.disabled=true);
- const t=setInterval(async()=>{const j=await (await fetch('/api/job/'+job_id)).json();
-  $('#pg').style.width=(j.total?j.done/j.total*100:0)+'%';$('#pt').textContent=`${j.done||0}/${j.total||0}`;
-  if(j.status=='finished'){clearInterval(t);document.querySelectorAll('button').forEach(b=>b.disabled=false);
-   if(j.errors&&j.errors.length)$('#err').textContent=j.errors.join('\\n');load()}},1500)}
-const gen=id=>run({product_id:id,count:+$('#n'+id).value}),weekly=()=>run({count:+$('#wn').value});
+async function run(qs){$('#err').textContent='';
+ const btns=document.querySelectorAll('button');btns.forEach(b=>b.disabled=true);
+ const mix=$('#mix').value,errs=[];let done=0,drop=0,pos=0,neg=0;
+ try{const pl=await (await fetch('/api/plan?'+qs)).json();
+  for(const ch of pl.chunks){
+   try{const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({product_id:ch.product_id,n:ch.n,mix,batch_id:pl.batch_id})});
+    const j=await r.json();if(j.error){errs.push(j.error);if(/GROQ_API_KEY/.test(j.error))break}
+    else{done+=j.saved;drop+=j.dropped;pos=j.pos;neg=j.neg}}catch(e){errs.push(String(e))}
+   $('#pg').style.width=(done/pl.total*100)+'%';
+   $('#pt').textContent=`${done}/${pl.total}  (positive ${pos} / negative ${neg}, dropped ${drop})`;
+   await new Promise(r=>setTimeout(r,2200))}}
+ catch(e){errs.push(String(e))}
+ btns.forEach(b=>b.disabled=false);if(errs.length)$('#err').textContent=errs.slice(0,5).join('\n');load()}
+const gen=id=>run(`product_id=${id}&count=${+$('#n'+id).value}`),weekly=()=>run(`count=${+$('#wn').value}`);
 async function view(id,name){pn.classList.add('open');$('#pt2').textContent=name;$('#pb').textContent='Loading...';
  const r=await (await fetch('/api/reviews/'+id)).json();
- $('#pb').innerHTML=r.length?r.map(x=>`<div class=rv><span class=st>${'&#9733;'.repeat(x.rating)}</span> <b style="display:inline">${esc(x.title)}</b>
-  <div>${esc(x.body)}</div><div class=rm>${esc(x.reviewer_name)} - ${esc(x.theme)} - ${esc(x.persona)} <a href=# onclick="del(${x.id},${id},'${esc(name).replace(/'/g,'')}');return false">delete</a></div></div>`).join(''):'No reviews yet.'}
+ $('#pb').innerHTML=r.length?r.map(x=>`<div class=rv><span class=st>${'&#9733;'.repeat(x.rating)}</span> <span class="sent ${x.sentiment}">${x.sentiment}</span>
+  <div>${esc(x.body)}</div><div class=rm>${esc(x.reviewer_name)} <a href=# onclick="del(${x.id},${id},'${esc(name).replace(/'/g,'')}');return false">delete</a></div></div>`).join(''):'No reviews yet.'}
 async function del(rid,pid,name){await fetch('/api/review/'+rid,{method:'DELETE'});view(pid,name);load()}
 async function syncP(){await fetch('/api/sync',{method:'POST'});load()}
 const pn=$('#pn');load();
@@ -430,6 +531,17 @@ def home():
     return render_template_string(PAGE)
 
 
+@app.before_request
+def password_gate():
+    """Optional login: set APP_PASSWORD (any username). Strongly recommended on any public URL."""
+    pw = os.environ.get("APP_PASSWORD")
+    if pw:
+        a = request.authorization
+        if not a or a.password != pw:
+            return Response("Login required", 401, {"WWW-Authenticate": 'Basic realm="Synthetic dataset"'})
+
+
+init_db()      # runs on import too, so serverless platforms (Vercel) get their tables
+
 if __name__ == "__main__":
-    init_db()
     app.run(port=5001, debug=False)
