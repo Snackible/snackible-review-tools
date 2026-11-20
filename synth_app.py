@@ -546,7 +546,7 @@ async function run(qs){$('#err').textContent='';
    $('#pt').textContent=`${done}/${pl.total}  (positive ${pos} / negative ${neg}, dropped ${drop})`;
    await new Promise(r=>setTimeout(r,2200))}}
  catch(e){errs.push(String(e))}
- btns.forEach(b=>b.disabled=false);if(errs.length)$('#err').textContent=errs.slice(0,5).join('\n');load()}
+ btns.forEach(b=>b.disabled=false);if(errs.length)$('#err').textContent=errs.slice(0,5).join(' | ');load()}
 const gen=id=>run(`product_id=${id}&count=${+$('#n'+id).value}`),weekly=()=>run(`count=${+$('#wn').value}`);
 async function view(id,name){pn.classList.add('open');$('#pt2').textContent=name;$('#pb').textContent='Loading...';
  const r=await (await fetch('/api/reviews/'+id)).json();
