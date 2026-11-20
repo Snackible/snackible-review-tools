@@ -9,7 +9,8 @@ Env:     ANTHROPIC_API_KEY, JUDGEME_API_TOKEN (private token), SHOP_DOMAIN (xxx.
          optional: WEEKLY_QUOTA (default 5)
 Run:     python portal.py   -> http://localhost:5000
 """
-import datetime as dt, os, sqlite3
+import datetime as dt, os, random, sqlite3
+from contextlib import contextmanager
 import requests
 from flask import Flask, jsonify, request, render_template_string
 
@@ -22,10 +23,19 @@ QUOTA = int(os.environ.get("WEEKLY_QUOTA", 5))
 DB = "/tmp/reviews.db" if os.environ.get("VERCEL") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "reviews.db")
 
 
+@contextmanager
 def db():
+    """Open a connection, commit on success, roll back on error, always close it."""
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def init_db():
@@ -56,9 +66,14 @@ def sync_products():
 @app.get("/api/products")
 def products():
     with db() as c:
-        if not c.execute("SELECT 1 FROM products").fetchone():
-            pass
-    sync_products()
+        last = c.execute("SELECT MAX(synced_at) FROM products").fetchone()[0]
+    stale = not last or (dt.datetime.now() - dt.datetime.fromisoformat(last)).total_seconds() > 600
+    if stale:                       # re-sync at most every 10 minutes
+        try:
+            sync_products()
+        except requests.RequestException as e:
+            if not last:
+                return jsonify({"error": f"Could not load products from the store: {e}"}), 502
     with db() as c:
         rows = c.execute("""
             SELECT p.*, (SELECT COUNT(*) FROM reviews r WHERE r.product_id=p.id
@@ -112,7 +127,7 @@ TITLES_4 = ["Good snack", "Tasty", "Nice taste", "Worth trying", "Good option", 
 
 def template_drafts(keywords, extra, rating):
     """Build reviews from the ticked keywords. Only ticked (true) options are used."""
-    import random
+
     def sents(k):
         if k in SENTENCES:
             return SENTENCES[k]
@@ -138,11 +153,13 @@ def template_drafts(keywords, extra, rating):
 
 @app.post("/api/draft")
 def draft():
-    d = request.json
+    d = request.get_json(silent=True) or {}
     kws, extra = d.get("keywords", []), d.get("extra", "")
     notes = ", ".join(kws) + (". " + extra if extra else "")
     if not notes.strip():
         return jsonify({"error": "Tick or type at least one keyword that is true for you."}), 400
+    if str(d.get("rating")) not in {"1", "2", "3", "4", "5"} or not d.get("id"):
+        return jsonify({"error": "Choose a rating and a product first."}), 400
     out = template_drafts(kws, extra, d["rating"])
     if os.environ.get("ANTHROPIC_API_KEY"):
         with db() as c:
@@ -161,25 +178,32 @@ def draft():
 
 @app.post("/api/publish")
 def publish():
-    d = request.json
+    d = request.get_json(silent=True) or {}
     if not d.get("reviewer_name", "").strip():
         return jsonify({"ok": False, "detail": "Name required"}), 400
-    body = d["body"]
+    if str(d.get("rating")) not in {"1", "2", "3", "4", "5"} or not d.get("body", "").strip() or not d.get("id"):
+        return jsonify({"ok": False, "detail": "Product, rating and review text are required"}), 400
+    shop, token = os.environ.get("SHOP_DOMAIN"), os.environ.get("JUDGEME_API_TOKEN")
+    if not shop or not token:
+        return jsonify({"ok": False, "detail": "Set SHOP_DOMAIN and JUDGEME_API_TOKEN first"}), 400
+    body = d["body"].strip()
     if d.get("sample"):
         body += "\n\n(Reviewer received a free sample of this product.)"
-    resp = requests.post("https://judge.me/api/v1/reviews", json={
-        "shop_domain": os.environ["SHOP_DOMAIN"], "platform": "shopify",
-        "api_token": os.environ["JUDGEME_API_TOKEN"], "id": d["id"],
-        "name": d["reviewer_name"].strip(),
-        "email": d.get("reviewer_email") or "reviews@snackible.com",
-        "rating": int(d["rating"]), "title": d["title"], "body": body,
-    }, timeout=30)
+    try:
+        resp = requests.post("https://judge.me/api/v1/reviews", json={
+            "shop_domain": shop, "platform": "shopify", "api_token": token, "id": d["id"],
+            "name": d["reviewer_name"].strip(),
+            "email": d.get("reviewer_email") or "reviews@snackible.com",
+            "rating": int(d["rating"]), "title": d.get("title", ""), "body": body,
+        }, timeout=30)
+    except requests.RequestException as e:
+        return jsonify({"ok": False, "detail": f"Judge.me unreachable: {e}"}), 502
     ok = resp.status_code < 300
     with db() as c:
         c.execute("INSERT INTO reviews(created_at,week,product_id,reviewer_name,rating,title,body,"
                   "keywords,got_sample,status,response) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (dt.datetime.now().isoformat(timespec="seconds"), rh.week_id(), d["id"],
-                   d["reviewer_name"].strip(), int(d["rating"]), d["title"], body,
+                   d["reviewer_name"].strip(), int(d["rating"]), d.get("title", ""), body,
                    ", ".join(d.get("keywords", [])), int(bool(d.get("sample"))),
                    "published" if ok else f"failed_{resp.status_code}", resp.text[:500]))
     return jsonify({"ok": ok, "detail": resp.text[:300]}), (200 if ok else 502)

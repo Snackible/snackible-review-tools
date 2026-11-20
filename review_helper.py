@@ -8,7 +8,7 @@ Setup:  pip install anthropic     and set ANTHROPIC_API_KEY
 Usage:  python review_helper.py status [--quota 5]
         python review_helper.py draft  [--quota 5]
 """
-import argparse, csv, datetime as dt, os, sys
+import argparse, csv, datetime as dt, sys
 from pathlib import Path
 
 import anthropic

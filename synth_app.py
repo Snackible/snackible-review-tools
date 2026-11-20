@@ -11,7 +11,8 @@ Setup:   pip install flask requests beautifulsoup4
 Keys:    copy .env.example to .env and put your GROQ_API_KEY in it
 Run:     python synth_app.py   ->  http://localhost:5001
 """
-import csv, datetime as dt, io, itertools, json, os, random, re, sqlite3, threading, time, uuid
+import csv, datetime as dt, io, itertools, json, os, random, re, sqlite3, time, uuid
+from contextlib import contextmanager
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -36,14 +37,22 @@ def load_env():
 
 load_env()
 app = Flask(__name__)
-JOBS = {}
 
 
 # ------------------------------------------------------------------ db
+@contextmanager
 def db():
+    """Open a connection, commit on success, roll back on error, always close it."""
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
-    return c
+    try:
+        yield c
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
 
 
 def init_db():
@@ -171,12 +180,6 @@ def similar(a, b):
 
 
 # ------------------------------------------------------------------ generation
-PERSONAS = ["college student", "working professional", "fitness-focused person", "parent of young kids",
-            "frequent traveller", "homemaker", "senior citizen", "gym-goer", "snack lover", "first-time buyer",
-            "repeat customer", "person who snacks late at night", "office-goer", "health-conscious shopper"]
-FOCUS = ["taste", "crunch and texture", "ingredients", "occasion for eating it", "value for money", "pack size",
-         "family reaction", "swap for regular snacks", "would buy again", "flavour intensity", "how filling it is",
-         "packaging"]
 # Binary sentiment only (no 3-star), so every review has a clean positive/negative label.
 MIX = {"binary": {5: 35, 4: 35, 2: 15, 1: 15},        # 70% positive / 30% negative
        "balanced": {5: 25, 4: 25, 2: 25, 1: 25},      # 50 / 50
@@ -249,7 +252,7 @@ def quality_problem(body, ptext):
     for w in re.findall(r"[a-z']+", body.lower()):
         if w not in allowed and not (w.endswith("s") and w[:-1] in allowed):
             return f"outside vocabulary: {w}"
-    last = re.findall(r"[a-z']+", body.lower())[-1]
+    last = (re.findall(r"[a-z']+", body.lower()) or [""])[-1]
     if last in CUT_OFF or re.search(r"\bno (refined|palm|added|artificial)\W*$", body.lower()):
         return "cut-off ending"
     for num in re.findall(r"\d+", body):
@@ -380,10 +383,13 @@ def plan():
     """Split a request into small chunks (<= CHUNK reviews, one product each). The browser runs them
     one after another, so no background thread is needed (works on Vercel and locally)."""
     rows = {r["id"]: r for r in product_rows()}
-    pid, count = request.args.get("product_id"), max(1, int(request.args.get("count", 100)))
+    pid = request.args.get("product_id", type=int)
+    count = max(1, request.args.get("count", 100, type=int))
+    if pid is not None and pid not in rows:
+        return jsonify({"error": "unknown product"}), 404
     alloc = {}
-    if pid:
-        alloc[int(pid)] = min(count, 50)
+    if pid is not None:
+        alloc[pid] = min(count, 50)
     else:   # weekly batch: spread across products, emptiest this week first
         order = sorted(rows.values(), key=lambda r: (r["this_week"], random.random()))
         for r in itertools.islice(itertools.cycle(order), min(count, 1000)):
@@ -399,14 +405,17 @@ def plan():
 
 @app.post("/api/generate")
 def generate():
-    d = request.json
+    d = request.get_json(silent=True) or {}
     rows = {r["id"]: r for r in product_rows()}
-    p = rows.get(int(d["product_id"]))
+    try:
+        p, n = rows.get(int(d.get("product_id"))), int(d.get("n", 1))
+    except (TypeError, ValueError):
+        return jsonify({"error": "product_id and n must be numbers"}), 400
     if not p:
         return jsonify({"error": "unknown product"}), 404
+    mix = d.get("mix") if d.get("mix") in MIX else "binary"
     try:
-        saved, dropped = generate_for_product(p, max(1, min(CHUNK, int(d["n"]))), d.get("mix", "binary"),
-                                              d.get("batch_id", "manual"))
+        saved, dropped = generate_for_product(p, max(1, min(CHUNK, n)), mix, d.get("batch_id", "manual"))
     except Exception as e:
         return jsonify({"error": f"{p['name']}: {e}"}), 500
     with db() as c:
@@ -435,12 +444,14 @@ def delete_review(rid):
 @app.get("/api/export.csv")
 def export():
     week = request.args.get("week")
-    q = "SELECT * FROM synthetic_reviews" + (" WHERE week=?" if week else "") + " ORDER BY id"
+    cols = ["id", "batch_id", "created_at", "week", "product_id", "product_name", "reviewer_name", "rating",
+            "sentiment", "body", "model", "synthetic"]
+    q = f"SELECT {','.join(cols)} FROM synthetic_reviews" + (" WHERE week=?" if week else "") + " ORDER BY id"
     with db() as c:
         rows = c.execute(q, (week,) if week else ()).fetchall()
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(rows[0].keys() if rows else ["id"])
+    w.writerow(cols)
     for r in rows:
         w.writerow(list(r))
     return Response(buf.getvalue(), mimetype="text/csv",

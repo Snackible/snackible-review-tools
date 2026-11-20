@@ -1,6 +1,6 @@
 """Snackible review audit: scrape products + existing Judge.me reviews, analyse, write Excel.
 Only retrieved/computed data. Respects robots.txt (allowed), 1.5-2s delay, max 3 retries."""
-import re, time, random, json, datetime as dt, collections, statistics
+import re, time, random, datetime as dt, collections, statistics
 import requests
 from bs4 import BeautifulSoup
 from openpyxl import Workbook
@@ -17,6 +17,7 @@ S = requests.Session(); S.headers.update(UA)
 
 
 def get(url, **kw):
+    err = ""
     for i in range(3):
         try:
             time.sleep(random.uniform(1.5, 2.0))
@@ -28,7 +29,7 @@ def get(url, **kw):
         except requests.RequestException as e:
             err = str(e)
         time.sleep(2 ** i)
-    qa.append(("failed_url", url, "after 3 tries"))
+    qa.append(("failed_url", url, f"after 3 tries {err}".strip()))
     return None
 
 
@@ -175,7 +176,7 @@ def intent(k):
 
 def main():
     prods = discover()
-    reviews, prow = [], []
+    reviews = []
     for i, (h, p) in enumerate(sorted(prods.items()), 1):
         if p["id"] is None:
             qa.append(("missing", h, "no product_id; reviews not fetched")); continue
@@ -295,7 +296,7 @@ def main():
           ["Products with 0 reviews", zero], ["Products with <5 reviews", low],
           ["Products with no review in last 90 days", sum(1 for x in P if x[20] == 0)],
           ["Reviews in last 7 days (all products)", sum(x[18] for x in P)],
-          [f"Weekly target per product (assumption)", WEEKLY_TARGET],
+          ["Weekly target per product (assumption)", WEEKLY_TARGET],
           ["Verified-buyer share %", round(sum(r["verified_buyer"] for r in reviews) / max(1, len(reviews)) * 100, 1)],
           ["Reviews with photos", sum(1 for r in reviews if r["photos"])],
           ["Products in stock %", round(sum(1 for p in prods.values() if p["available"]) / len(prods) * 100, 1)]]
