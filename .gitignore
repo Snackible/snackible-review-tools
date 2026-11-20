@@ -1,0 +1,6 @@
+.env
+*.db
+*.xlsx
+*.log
+__pycache__/
+reviews_log.csv

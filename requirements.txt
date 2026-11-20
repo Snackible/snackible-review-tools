@@ -1,0 +1,5 @@
+flask
+requests
+anthropic
+beautifulsoup4
+openpyxl
